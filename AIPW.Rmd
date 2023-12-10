@@ -1,0 +1,123 @@
+---
+title: "Final"
+author: "Puyin Li"
+date: "2023-12-03"
+output: pdf_document
+---
+# Data pre-processing
+```{r}
+library(readr)
+clean_data_test <- read_csv("/Users/paulineli/Desktop/STATS 209/Final Project/clean_data_test.csv")
+dat <- clean_data_test[, -c(14, 15, 16, 17, 18, 19, 20, 21, 22)]
+dat$Y <- (clean_data_test$Proj.Suc1 + clean_data_test$Proj.Suc2 + clean_data_test$Proj.Suc3
+             + clean_data_test$Proj.Suc4 + clean_data_test$Proj.Suc5 + clean_data_test$Proj.Suc6
+             + clean_data_test$Proj.Suc7 + clean_data_test$Proj.Suc8 + clean_data_test$Proj.Suc9) / 9
+colnames(dat)[14] <- "Z"
+colnames(dat)[1] <- "idx"
+# make binary variables 0/1
+dat$Gender <- dat$Gender - 1
+dat$NGOcharacteristic <- dat$NGOcharacteristic - 1
+dat$Tenure <- dat$Tenure - 1
+```
+
+# AIPW
+
+## Step 1: Calculate propensity score e(X)
+```{r}
+dat$prop <- glm(Z ~ Gender + Education + Age + NGOcharacteristic + ProjectCharacteristic +
+                  TeamSize + Tenure + ProjectDuration, family = binomial, data = dat)$fitted.values
+```
+
+## Step 2: esitimate mu_1 and mu_0 (via randomforest cross-fitting)
+```{r}
+library(randomForest)
+
+# cross-fitting function, returns the mean and the variance of estimation
+cross_fitting <- function(I_1, I_2){
+  I_10 <- I_1[I_1$Z == 0,]
+  I_10 <- subset(I_10, select = -c(Z)) # subset of controlled units in I_1
+  I_11 <- I_1[I_1$Z == 1,]
+  I_11 <- subset(I_11, select = -c(Z)) # subset of treated units in I_1
+  I_20 <- I_2[I_2$Z == 0,]
+  I_20 <- subset(I_20, select = -c(Z)) # subset of controlled units in I_2
+  I_21 <- I_2[I_2$Z == 1,]
+  I_21 <- subset(I_21, select = -c(Z)) # subset of treated units in I_1
+  
+  # train on I_2 to estimate I_1
+  set.seed(123)
+  rf_0 <- randomForest(Y ~., data = I_20, importance = TRUE) # train random forest on control group
+  rf_1 <- randomForest(Y ~., data = I_21, importance = TRUE) # train random forest on treatment group
+  Z_i = I_1$Z # a vector that records which units are treated 
+  Y_i1 = I_11$Y
+  Y_i0 = I_10$Y
+  n_11 = sum(Z_i)
+  n_10 = sum(1 - Z_i)
+  n_I1 = n_11 + n_10
+  
+  # correction terms
+  correct_1 = 1/n_11 * sum(I_11$Y - predict(rf_1, I_11))
+  correct_0 = 1/n_10 * sum(I_10$Y - predict(rf_0, I_10))
+  
+  # calibrated mu
+  mu_tilde_1_0 = predict(rf_1, I_10) + correct_1 # mu_tilde_1 for I_10
+  mu_tilde_1_1 = predict(rf_1, I_11) + correct_1 # mu_tilde_1 for I_11
+  mu_tilde_0_0 = predict(rf_0, I_10) + correct_0 # mu_tilde_0 for I_10
+  mu_tilde_0_1 = predict(rf_0, I_11) + correct_0 # mu_tilde_0 for I_11  
+  
+  I_10$mu_0 <- mu_tilde_0_0
+  I_10$mu_1 <- mu_tilde_1_0
+  I_10$Z <- 0
+  I_11$mu_0 <- mu_tilde_1_1
+  I_11$mu_1 <- mu_tilde_0_1
+  I_11$Z <- 1
+  
+  predicted_dat <- rbind(I_10, I_11)
+  return(predicted_dat)
+}
+
+prediction_gen <- function(dt){
+  # centralize covariates
+  X <- model.matrix(~ 0 + Gender + Education + Age + NGOcharacteristic + factor(ProjectCharacteristic) +
+                    TeamSize + Tenure + ProjectDuration, family = binomial, data = dt)
+  X <- scale(X, center=TRUE, scale=FALSE)
+  df <- data.frame(dt$Y, dt$Z, dt$prop, X)
+  colnames(df)[1] <- "Y"
+  colnames(df)[2] <- "Z"
+  colnames(df)[3] <- "prop"
+  
+  # split into twod data sets for cross-fitting
+  set.seed(123456)
+  sample <- sample(nrow(df), size=nrow(df) / 2)
+  set1 <- df[c(sample), ]
+  set2 <- df[-c(sample),]
+  pred_set1 <- cross_fitting(set1, set2)
+  pred_set2 <- cross_fitting(set2, set1)
+  df <- rbind(pred_set1, pred_set2)
+  return(df)
+}
+```
+
+## Step 3: Derive doubly robust estimator
+```{r}
+  df <- prediction_gen(dat)
+  mu1_dr = 1 / nrow(df) * sum(df$Z * (df$Y - df$mu_1) / df$prop + df$mu_1) 
+  mu0_dr = 1 / nrow(df) * sum((1- df$Z) * (df$Y - df$mu_0) / (1 - df$prop) + df$mu_0) 
+  tau_dr = mu1_dr - mu0_dr
+```
+
+## Step 4: Bootstrap the process to get variance
+```{r}
+library(boot)
+set.seed(1234)
+dr_estimator <- function(dt, indices){
+  d <- dt[indices, ]
+  df <- prediction_gen(d)
+  mu1_dr = 1 / nrow(df) * sum(df$Z * (df$Y - df$mu_1) / df$prop + df$mu_1) 
+  mu0_dr = 1 / nrow(df) * sum((1- df$Z) * (df$Y - df$mu_0) / (1 - df$prop) + df$mu_0) 
+  tau_dr = mu1_dr - mu0_dr
+  return(tau_dr)
+}
+
+boot_result <- boot(data=dat, statistic=dr_estimator, R = 1000)
+print(boot_result)
+```
